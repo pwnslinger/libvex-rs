@@ -10,7 +10,6 @@ use fs_extra::dir::{copy, CopyOptions};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-
 fn vex_headers() -> Result<Vec<String>> {
     match env::var("VEX_HEADERS") {
         Ok(paths) => {
@@ -41,33 +40,38 @@ fn apply_patches(valgrind_dir: PathBuf, patch_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn copy_valgrind(out_dir: &Path) -> Result<()> {
+fn copy_valgrind(out_dir: &Path, valgrind_dir_name: &str) -> Result<()> {
     let mut options = CopyOptions::default();
     options.copy_inside = true;
-    copy("valgrind", out_dir, &options)?;
-    println!("cargo:rerun-if-changed=valgrind/");
+    copy(valgrind_dir_name, out_dir, &options)?;
+    println!("cargo:rerun-if-changed={}/", valgrind_dir_name);
     match env::var("VEX_PATCHES") {
-        Ok(path) => apply_patches(out_dir.join("valgrind"), PathBuf::from(path))?,
+        Ok(path) => apply_patches(out_dir.join(valgrind_dir_name), PathBuf::from(path))?,
         Err(VarError::NotUnicode(path)) =>
-            apply_patches(out_dir.join("valgrind"), PathBuf::from(path))?,
+            apply_patches(out_dir.join(valgrind_dir_name), PathBuf::from(path))?,
         Err(VarError::NotPresent) => {}
     }
     Ok(())
 }
 
 fn find_vex() -> Result<PathBuf> {
-    Ok(match env::var("VEX_SRC") {
+    match env::var("VEX_SRC") {
         Ok(path) => {
+            eprintln!("[DEBUG] find_vex: using VEX_SRC env var: {}", path);
             println!("cargo:rerun-if-changed={}", path);
-            PathBuf::from(path)
-        }
-        // It would be nice to cargo:rerun-if-changed=path here, but can we?...
-        Err(VarError::NotUnicode(path)) => PathBuf::from(path),
+            Ok(PathBuf::from(path))
+        },
+        Err(VarError::NotUnicode(path)) => {
+            eprintln!("[DEBUG] find_vex: VEX_SRC not unicode: {:?}", path);
+            Ok(PathBuf::from(path))
+        },
         Err(_) => {
+            eprintln!("[DEBUG] find_vex: falling back to OUT_DIR logic");
             let out_dir = PathBuf::from(env::var("OUT_DIR")?);
-            let valgrind_dir = out_dir.join("valgrind");
+            let valgrind_dir_name = "valgrind";
+            let valgrind_dir = out_dir.join(valgrind_dir_name);
             if !valgrind_dir.exists() {
-                copy_valgrind(&out_dir)?;
+                copy_valgrind(&out_dir, valgrind_dir_name)?;
             }
             if !valgrind_dir.join("configure").exists() {
                 Command::new("./autogen.sh")
@@ -82,9 +86,9 @@ fn find_vex() -> Result<PathBuf> {
                 }
                 configure.status()?;
             }
-            valgrind_dir.join("VEX")
-        }
-    })
+            Ok(valgrind_dir.join("VEX"))
+        },
+    }
 }
 
 fn compile_vex() -> Result<PathBuf> {
@@ -102,13 +106,58 @@ fn compile_vex() -> Result<PathBuf> {
 /// Return its directory.
 fn ensure_lib() -> Result<PathBuf> {
     match env::var("VEX_LIBS") {
-        Ok(path) => Ok(PathBuf::from(path)),
-        Err(VarError::NotUnicode(path)) => Ok(PathBuf::from(path)),
-        Err(_) => compile_vex(),
+        Ok(path) => {
+            eprintln!("[DEBUG] ensure_lib: using VEX_LIBS env var: {}", path);
+            Ok(PathBuf::from(path))
+        },
+        Err(VarError::NotUnicode(path)) => {
+            eprintln!("[DEBUG] ensure_lib: VEX_LIBS not unicode: {:?}", path);
+            Ok(PathBuf::from(path))
+        },
+        Err(_) => {
+            eprintln!("[DEBUG] ensure_lib: falling back to compile_vex");
+            compile_vex()
+        },
     }
 }
 
 fn main() -> Result<()> {
+    // Debug print environment variables at the start
+    eprintln!("[DEBUG] VEX_SRC={:?}", std::env::var("VEX_SRC"));
+    eprintln!("[DEBUG] VEX_HEADERS={:?}", std::env::var("VEX_HEADERS"));
+    eprintln!("[DEBUG] VEX_LIBS={:?}", std::env::var("VEX_LIBS"));
+    // --- macOS automation: ensure patched Valgrind is present and envs are set ---
+    if cfg!(target_os = "macos") {
+        let need_envs = ["VEX_SRC", "VEX_HEADERS", "VEX_LIBS"]
+            .iter()
+            .any(|&k| std::env::var(k).is_err());
+        if need_envs {
+            eprintln!("[INFO] macOS detected and VEX env vars not set. Running build-macos.sh to bootstrap...");
+            let output = Command::new("./build-macos.sh")
+                .arg("--env")
+                .output()?;
+            if !output.status.success() {
+                eprintln!("[ERROR] build-macos.sh failed. Output:\n{}", String::from_utf8_lossy(&output.stderr));
+                std::process::exit(1);
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some((key, val)) = line.strip_prefix("export ").and_then(|l| l.split_once('=')) {
+                    let val = val.trim_matches('"');
+                    std::env::set_var(key, val);
+                    eprintln!("[DEBUG] Set {}={}", key, val);
+                }
+            }
+        }
+        // Emit rustc-env for all VEX envs so dependents and examples inherit them
+        for key in ["VEX_SRC", "VEX_HEADERS", "VEX_LIBS"] {
+            if let Ok(val) = std::env::var(key) {
+                println!("cargo:rustc-env={}={}", key, val);
+            }
+        }
+    }
+    // --- end macOS automation ---
+
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let host = env::var("HOST")?;
 
@@ -126,7 +175,11 @@ fn main() -> Result<()> {
         let vex_dir = ensure_lib()?;
 
         // Tell rustc to link to libvex
-        println!("cargo:rustc-link-search=native={}", vex_dir.display());
+        if cfg!(target_os = "macos") {
+            println!("cargo:rustc-link-search=native=libvex-sys/valgrind-mac/VEX");
+        } else {
+            println!("cargo:rustc-link-search=native={}", vex_dir.display());
+        }
         println!("cargo:rustc-link-lib=static=vex-{}-{}", arch, platform);
     }
 
