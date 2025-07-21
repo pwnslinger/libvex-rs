@@ -103,6 +103,7 @@ impl Const<'_> {
                 };
                 ConstEnum::V256(vec)
             }
+            _ => todo!("Unimplemented IRConstTag variant: {:?}", co.tag),
         }
     }
 
