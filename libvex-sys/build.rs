@@ -165,7 +165,11 @@ fn main() -> Result<()> {
         let (arch, platform) = {
             let mut host_parts = host.as_str().split("-");
             let arch = host_parts.next().unwrap();
-            let arch = if arch == "x86_64" { "amd64" } else { arch };
+            let arch = match arch {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                other => other,
+            };
             let _ = host_parts.next();
             let platform = host_parts.next().unwrap();
 
@@ -174,13 +178,14 @@ fn main() -> Result<()> {
 
         let vex_dir = ensure_lib()?;
 
-        // Tell rustc to link to libvex
-        if cfg!(target_os = "macos") {
-            println!("cargo:rustc-link-search=native=libvex-sys/valgrind-mac/VEX");
-        } else {
-            println!("cargo:rustc-link-search=native={}", vex_dir.display());
+        println!("cargo:rustc-link-search=native={}", vex_dir.display());
+        let multiarch_lib = format!("vexmultiarch-{}-{}", arch, platform);
+        let singlearch_lib = format!("vex-{}-{}", arch, platform);
+        let lib_dir = std::path::Path::new(&vex_dir);
+        if lib_dir.join(format!("lib{}.a", multiarch_lib)).exists() {
+            println!("cargo:rustc-link-lib=static={}", multiarch_lib);
         }
-        println!("cargo:rustc-link-lib=static=vex-{}-{}", arch, platform);
+        println!("cargo:rustc-link-lib=static={}", singlearch_lib);
     }
 
     {
